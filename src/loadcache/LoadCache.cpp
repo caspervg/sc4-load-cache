@@ -7,8 +7,9 @@
 //   game's segment order, and segments added since (city saves) are asked as before.
 // - Exemplar scans. Nine scans load every exemplar to read its ExemplarType (property 0x10) and
 //   keep only one type, the Type 21 scan alone about 4.5 s per load. The type of each exemplar
-//   is remembered, and a scan's callback is skipped for exemplars of another type. Exemplars not
-//   seen before go to the game as before.
+//   is remembered, and a scan's callback is skipped for exemplars of another type. The type of
+//   an exemplar not seen before is read from the bytes of its record where that is certain
+//   (ExemplarType.h); the others go to the game as before.
 //
 // Windows SimCity 4 1.1.641 only (docs/re-notes.md). Writes SC4LoadCache.log next to
 // the DLL.
@@ -35,6 +36,8 @@
 
 #include "cIGZFrameWork.h"
 #include "cRZMessage2COMDirector.h"
+
+#include "ExemplarType.h"
 
 namespace
 {
@@ -377,6 +380,137 @@ namespace
         return found ? type : kNoType;
     }
 
+    // ---- exemplar type from the raw record ----
+    // The first scan of a session built every exemplar only to read its type. The record is
+    // opened as the game's loader opens it (0x00972f1d: FindDBSegment, then the segment's
+    // OpenRecord, which also unpacks it) and exemplar_type::FromRecord walks its bytes.
+    //
+    // SC4ResourceLoadingHooks puts the properties of exemplar patches (cohorts of group
+    // 0xb03697d1) into an exemplar when it loads. A patch with an ExemplarType of its own could
+    // change the type the game reads, so with such a patch the raw read is off for the session.
+    constexpr uint32_t kCohortType = 0x05342861;
+    constexpr uint32_t kExemplarPatchGroup = 0xb03697d1;
+    constexpr uint32_t kHolderIid = 0x25216283;          // cISCPropertyHolder
+    constexpr uint32_t kMaxRawRecord = 4 * 1024 * 1024;  // larger records go to the game
+    bool gVerifyRaw = false;  // SC4LoadCache.verify next to the DLL: compare with the game's type
+    uint64_t gRawRead = 0, gRawLeft = 0, gRawTicks = 0;
+    uint64_t gVerifySame = 0, gVerifyNotLoaded = 0, gVerifyDifferent = 0;
+
+    void __cdecl FindPatchWithType(const Key* key, void* found)
+    {
+        using GetResourceFn = bool(__thiscall*)(void*, const Key&, uint32_t, void**, uint32_t, void*);
+        void* rm = *reinterpret_cast<void**>(kResourceManagerPtr);
+        void* holder = nullptr;
+        if (key->group != kExemplarPatchGroup || *static_cast<bool*>(found) ||
+            !Slot<GetResourceFn>(rm, 0xc)(rm, *key, kHolderIid, &holder, 0, nullptr) || !holder) {
+            return;
+        }
+        // GetProperty (holder slot +0x24): also finds a property of the patch's parent cohort.
+        if (Slot<void*(__thiscall*)(void*, uint32_t)>(holder, 0x24)(holder, kExemplarTypeProperty)) {
+            *static_cast<bool*>(found) = true;
+            Log("Raw exemplar types: off, exemplar patch %08X %08X %08X has an ExemplarType", key->type, key->group,
+                key->instance);
+        }
+        Release(holder);
+    }
+
+    // Decided at the first exemplar of the session. Call with the resource lock held.
+    bool RawReadAllowed(void* rm)
+    {
+        static const bool allowed = [rm] {
+            struct
+            {
+                uintptr_t vtable = kTypeFilterVtable;
+                uint32_t refs = 1;
+                uint32_t type = kCohortType;
+            } filter;
+            void* cohorts = nullptr;
+            Slot<uint32_t(__thiscall*)(void*, void**, void*)>(rm, 0x44)(rm, &cohorts, &filter);
+            if (!cohorts) {
+                return false;
+            }
+            bool patchWithType = false;
+            ListEnum(cohorts, &FindPatchWithType, &patchWithType);
+            Release(cohorts);
+            return !patchWithType;
+        }();
+        return allowed;
+    }
+
+    // The type of an exemplar from its record, or nothing: the caller then asks the game.
+    std::optional<uint32_t> RawExemplarType(const Key& key)
+    {
+        void* rm = *reinterpret_cast<void**>(kResourceManagerPtr);
+        if (!rm) {
+            return std::nullopt;
+        }
+        LARGE_INTEGER start, end;
+        QueryPerformanceCounter(&start);
+        std::optional<uint32_t> type;
+        {
+            RmLock rmLock(rm, kResourceLock);  // as GetResource holds it; also guards the buffer
+            void* segment = nullptr;
+            if (RawReadAllowed(rm) && Slot<bool(__thiscall*)(void*, const Key&, void**)>(rm, 0x80)(rm, key, &segment) &&
+                segment) {
+                // Segment slots: +0x54 OpenRecord(key, record**, 1 for reading), +0x60
+                // CloseRecord(record), +0x64 AbortRecord(record**). Record slots: +0x18
+                // GetFieldVoid(buffer, size), +0x20 GetSize.
+                void* record = nullptr;
+                const bool startup = gStartupSegments.contains(segment);
+                if (startup && Slot<bool(__thiscall*)(void*, const Key&, void**, uint32_t)>(segment, 0x54)(
+                                   segment, key, &record, 1) && record) {
+                    static std::vector<uint8_t> bytes;
+                    const uint32_t size = Slot<uint32_t(__thiscall*)(void*)>(record, 0x20)(record);
+                    try {
+                        if (size <= kMaxRawRecord) {
+                            bytes.resize(size);
+                            if (Slot<bool(__thiscall*)(void*, void*, uint32_t)>(record, 0x18)(record, bytes.data(), size)) {
+                                type = exemplar_type::FromRecord(bytes.data(), size);
+                            }
+                        }
+                    }
+                    catch (...) {
+                    }
+                    Slot<bool(__thiscall*)(void*, void*)>(segment, 0x60)(segment, record);
+                    Release(record);
+                }
+                else if (record) {
+                    Slot<bool(__thiscall*)(void*, void**)>(segment, 0x64)(segment, &record);
+                }
+                Release(segment);
+            }
+        }
+        QueryPerformanceCounter(&end);
+        gRawTicks += static_cast<uint64_t>(end.QuadPart - start.QuadPart);
+        ++(type ? gRawRead : gRawLeft);
+        return type;
+    }
+
+    // Verify mode: the raw type against what the game read after loading the exemplar.
+    void VerifyRawType(const Key& key, const std::optional<uint32_t> raw, const std::optional<uint32_t> loaded)
+    {
+        if (!raw) {
+            return;
+        }
+        if (raw == loaded) {
+            ++gVerifySame;
+        }
+        else if (!loaded) {
+            // It did not load: no scan takes it, whatever its record says.
+            if (++gVerifyNotLoaded <= 50) {
+                Log("Verify: %08X %08X %08X did not load, raw type %08X", key.type, key.group, key.instance, *raw);
+            }
+        }
+        else if (++gVerifyDifferent <= 500) {
+            Log("Verify: %08X %08X %08X DIFFERENT, raw type %08X, the game read %08X", key.type, key.group,
+                key.instance, *raw, *loaded);
+        }
+        if ((gVerifySame + gVerifyNotLoaded + gVerifyDifferent) % 20000 == 0) {
+            Log("Verify: %llu the same, %llu did not load, %llu different so far", gVerifySame, gVerifyNotLoaded,
+                gVerifyDifferent);
+        }
+    }
+
     // A scan callback, cdecl (const key*, context). Each loads the exemplar, reads property 0x10
     // and only releases it again when the type is not one it takes (each one checked in Ghidra,
     // docs/re-notes.md).
@@ -414,6 +548,17 @@ namespace
                 known = true;
             }
         }
+        std::optional<uint32_t> raw;
+        if (!known && (raw = RawExemplarType(*key)) && !gVerifyRaw) {
+            type = *raw;
+            known = true;
+            try {
+                std::scoped_lock lock(gTypeMutex);
+                gExemplarTypes.emplace(*key, type);
+            }
+            catch (...) {
+            }
+        }
         if (known) {
             const bool takes =
                 type != kNoType &&
@@ -430,13 +575,17 @@ namespace
         ++gScanPassed;
         if (!known) {
             // The callback loaded it just now, so this read comes from the game's cache.
-            if (const std::optional<uint32_t> read = ReadExemplarType(*key)) {
+            const std::optional<uint32_t> read = ReadExemplarType(*key);
+            if (read) {
                 try {
                     std::scoped_lock lock(gTypeMutex);
                     gExemplarTypes.emplace(*key, *read);
                 }
                 catch (...) {
                 }
+            }
+            if (gVerifyRaw) {
+                VerifyRawType(*key, raw, read);
             }
         }
     }
@@ -569,6 +718,7 @@ public:
         gLogPath = std::filesystem::path(path).parent_path() / L"SC4LoadCache.log";
         std::error_code ec;
         std::filesystem::remove(gLogPath, ec);
+        gVerifyRaw = std::filesystem::exists(gLogPath.parent_path() / L"SC4LoadCache.verify", ec);
 
         const uint16_t version = GameVersion();
         if (version != kGameVersion) {
@@ -625,6 +775,14 @@ public:
             "exemplar types known. File seeks: %llu inside the buffer, %llu passed on. %llu read buffers grown",
             gListHits, gListMisses, gScanSkipped, gScanPassed, gExemplarTypes.size(), gSeeksSkipped.load(), gSeeksPassed.load(),
             gBuffersGrown.load());
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        Log("Raw exemplar types: %llu read, %llu left to the game, %.0f ms", gRawRead, gRawLeft,
+            1000.0 * static_cast<double>(gRawTicks) / static_cast<double>(frequency.QuadPart));
+        if (gVerifyRaw) {
+            Log("Verify: %llu the same, %llu did not load, %llu DIFFERENT", gVerifySame, gVerifyNotLoaded,
+                gVerifyDifferent);
+        }
         return true;
     }
 };
