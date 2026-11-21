@@ -14,6 +14,7 @@
 // the DLL.
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <array>
 #include <atomic>
@@ -285,6 +286,23 @@ namespace
         const TypeKeys* known = KeysOfType(type, segments);
         void* list = known ? NewKeyList() : nullptr;
         if (!list) {
+            // Which code asks for lists that are not kept (once per type and caller): such a caller can
+            // often keep its own result instead (Plop and Paint listed every texture on each load).
+            static std::unordered_set<uint64_t> logged;
+            uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+            if (caller == 0x009732b7) {  // from GetResourceListForType: its caller's return address is 20 bytes up
+                caller = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(_AddressOfReturnAddress()) + 20);
+            }
+            if (logged.insert((static_cast<uint64_t>(type) << 32) | caller).second) {
+                HMODULE module = nullptr;
+                char name[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCSTR>(caller), &module)) {
+                    GetModuleFileNameA(module, name, MAX_PATH);
+                }
+                Log("Key lists: type %08X not kept, asked from %08X (%s +%X)", type, static_cast<unsigned>(caller), name,
+                    static_cast<unsigned>(caller - reinterpret_cast<uintptr_t>(module)));
+            }
             return gGetResourceList(rm, edx, out, filter);
         }
         *out = list;
