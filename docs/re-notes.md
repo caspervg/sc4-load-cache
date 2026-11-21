@@ -25,6 +25,17 @@ SC4DBPFLoading packs the plugins into 13 segments at start-up. Lists built per s
 exemplars 192919 keys (11 calls per load), textures 2602374 keys (once per load, not kept
 over 500000 keys), three small ones. Scan callbacks skipped: 7.2 million, passed 288000.
 
+Later runs, same cities (one run each; first loads vary by a second or two):
+
+| version | first load | later loads |
+|---|---|---|
+| + seek inside the buffer, type and group lists | 15.8 s | 1.9-4.5 s |
+| + 64 KB buffer for every file after 8 refills | 18.7 s | 2.1-4.7 s |
+| + 64 KB buffer only after 8 refills in a row | 14.1 s | 2.2-4.4 s |
+
+Growing every busy file made the first-load exemplar scan (`0x004a4310`) 2.5 times slower:
+plugin files are read at random places, so each refill read 64 KB for one small record.
+
 ## Key lists
 
 - `ResourceManager::GetResourceList` `0x009739cb`, thiscall `(list** out, filter*)` -> key count

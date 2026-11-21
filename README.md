@@ -8,8 +8,8 @@ Measured with a large plugins folder (Kanto Tokai region, plugins on OneDrive):
 
 | | without | with SC4LoadCache |
 |---|---|---|
-| first city after starting the game | 30-32 s | 23.4 s |
-| every city after that | 11.6 s | 1.9-4.3 s |
+| first city after starting the game | 30-32 s | 14.1 s |
+| every city after that | 11.6 s | 1.9-4.4 s |
 
 ## What it does
 
@@ -21,7 +21,12 @@ Measured with a large plugins folder (Kanto Tokai region, plugins on OneDrive):
   type (Type 21 network props, automata, demand and others). The type of each exemplar is
   remembered, and an exemplar of another type is not loaded again.
 
-Both give the game exactly what it would have built itself. Details, addresses and the review
+- **File reads.** The game moves the file position with a system call before every read, also
+  when the bytes are already in its read buffer, and reads text files such as NAM's RUL files
+  512 bytes at a time. A seek inside the buffer now only moves the position, and a file read
+  straight through gets a 64 KB buffer.
+
+All of it gives the game exactly what it would have read or built itself. Details, addresses and the review
 notes are in [docs/re-notes.md](docs/re-notes.md).
 
 ## Install

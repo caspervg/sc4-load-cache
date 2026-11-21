@@ -41,6 +41,7 @@ namespace
     constexpr uintptr_t kResourceManagerPtr = 0x00b43ca8;
     constexpr uintptr_t kGetResourceList = 0x009739cb;   // thiscall(rm, list** out, filter*) -> count
     constexpr uintptr_t kFileSeek = 0x0091895a;          // thiscall(file, offset, mode) -> position
+    constexpr uintptr_t kFileRefill = 0x00918f67;        // fastcall(file) -> bool
     constexpr uintptr_t kGetPropertyUint = 0x005fd480;   // cdecl(holder, id, uint32_t* out) -> bool
     constexpr uintptr_t kOperatorNew = 0x005e55e0;       // cdecl(size)
     constexpr uintptr_t kKeyListCtor = 0x00974e7a;       // thiscall(memory) -> list
@@ -457,6 +458,65 @@ namespace
         return gSeek(file, edx, offset, mode);
     }
 
+    // cRZFile's buffer refill (0x00918f67, fastcall) reads +0x50 bytes, 512 by default, at the
+    // system's file position (+0x4c) and notes them at +0x60/+0x64. A file read straight
+    // through (the RUL and INI files of NAM, several MB) gets a larger buffer through its own
+    // SetBuffering (slot +0x7c, thiscall(read size, write size); a larger read size keeps the
+    // buffered bytes, the same write size changes nothing). Only after refills that each go on
+    // where the last ended: plugin files are read at random places, where a larger buffer only
+    // reads more (measured: the first load 3 s slower when every busy file grew).
+    using RefillFn = bool(__fastcall*)(void* file);
+    RefillFn gRefill = nullptr;
+    constexpr int32_t kLargeReadBuffer = 64 * 1024;
+    constexpr uint32_t kSequentialRefills = 8;
+    struct RefillTrack
+    {
+        int32_t end = -1;  // file offset after the last refill
+        uint32_t inARow = 0;
+    };
+    std::mutex gRefillMutex;
+    std::unordered_map<void*, RefillTrack> gRefills;
+    std::atomic<uint64_t> gBuffersGrown = 0;
+
+    bool __fastcall RefillHook(void* file)
+    {
+        auto* f = static_cast<uint8_t*>(file);
+        const auto field = [f](const size_t at) -> int32_t& { return *reinterpret_cast<int32_t*>(f + at); };
+        const int32_t readSize = field(0x50);
+        if (readSize <= 0 || readSize >= kLargeReadBuffer) {
+            return gRefill(file);
+        }
+        bool grow = false;
+        try {
+            std::scoped_lock lock(gRefillMutex);
+            RefillTrack& track = gRefills[file];
+            track.inARow = track.end == field(0x4c) ? track.inARow + 1 : 0;
+            if (track.inARow >= kSequentialRefills) {
+                gRefills.erase(file);
+                grow = true;
+            }
+        }
+        catch (...) {
+        }
+        if (grow) {
+            const uint32_t writeSize = static_cast<uint32_t>(field(0x68));
+            Slot<bool(__thiscall*)(void*, uint32_t, uint32_t)>(file, 0x7c)(file, kLargeReadBuffer, writeSize);
+            ++gBuffersGrown;
+        }
+        const bool ok = gRefill(file);
+        if (!grow) {
+            try {
+                std::scoped_lock lock(gRefillMutex);
+                if (const auto it = gRefills.find(file); it != gRefills.end()) {
+                    it->second.end = ok ? field(0x60) + field(0x64) : -1;
+                }
+            }
+            catch (...) {
+            }
+        }
+        return ok;
+    }
+
     uint16_t GameVersion()
     {
         wchar_t path[MAX_PATH]{};
@@ -511,6 +571,8 @@ public:
         hook(kGetResourceList, reinterpret_cast<void*>(&GetResourceListHook), reinterpret_cast<void**>(&gGetResourceList),
              "GetResourceList");
         hook(kFileSeek, reinterpret_cast<void*>(&SeekHook), reinterpret_cast<void**>(&gSeek), "cRZFile::Seek");
+        hook(kFileRefill, reinterpret_cast<void*>(&RefillHook), reinterpret_cast<void**>(&gRefill),
+             "cRZFile buffer refill");
         const std::array<void*, kScanCount> scanHooks = ScanHooks(std::make_index_sequence<kScanCount>());
         for (size_t i = 0; i < kScanCount; ++i) {
             hook(kScans[i].address, scanHooks[i], reinterpret_cast<void**>(&gScanOriginal[i]), kScans[i].name);
@@ -542,8 +604,9 @@ public:
     bool PreAppShutdown() override
     {
         Log("Key lists: %llu from the cache, %llu built. Exemplar scans: %llu callbacks skipped, %llu passed, %zu "
-            "exemplar types known. File seeks: %llu inside the buffer, %llu passed on",
-            gListHits, gListMisses, gScanSkipped, gScanPassed, gExemplarTypes.size(), gSeeksSkipped.load(), gSeeksPassed.load());
+            "exemplar types known. File seeks: %llu inside the buffer, %llu passed on. %llu read buffers grown",
+            gListHits, gListMisses, gScanSkipped, gScanPassed, gExemplarTypes.size(), gSeeksSkipped.load(), gSeeksPassed.load(),
+            gBuffersGrown.load());
         return true;
     }
 };
