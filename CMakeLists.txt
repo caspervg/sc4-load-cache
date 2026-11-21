@@ -42,6 +42,13 @@ add_library(SC4LoadCache SHARED src/loadcache/LoadCache.cpp src/loadcache/SC4Loa
 target_link_libraries(SC4LoadCache PRIVATE gzcom2 minhook version)
 sc4_plugin(SC4LoadCache)
 
+# The raw record reader of the cache on its own: ctest, and tests/check_exemplar_types.py.
+add_executable(exemplar_type_test tests/exemplar_type_test.cpp)
+target_include_directories(exemplar_type_test PRIVATE src/loadcache)
+target_compile_options(exemplar_type_test PRIVATE /W4 /utf-8)
+enable_testing()
+add_test(NAME exemplar_type COMMAND exemplar_type_test)
+
 # The profiler: a test DLL that times city loads, not shipped.
 add_library(SC4LoadProfiler SHARED src/profiler/LoadProfiler.cpp src/profiler/SC4LoadProfiler.def)
 target_link_libraries(SC4LoadProfiler PRIVATE gzcom2 minhook winmm)
