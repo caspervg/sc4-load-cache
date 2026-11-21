@@ -19,8 +19,7 @@ Measured with a large plugins folder (Kanto Tokai region, plugins on OneDrive):
   before.
 - **Exemplar scans.** Nine places in the game load every exemplar to keep only one exemplar
   type (Type 21 network props, automata, demand and others). The type of each exemplar is
-  remembered, and an exemplar of another type is not loaded again. The first time, the type
-  is read straight from the exemplar's record where that is certain, without loading it.
+  remembered, and an exemplar of another type is not loaded again.
 - **File reads.** The game moves the file position with a system call before every read, also
   when the bytes are already in its read buffer, and reads text files such as NAM's RUL files
   512 bytes at a time. A seek inside the buffer now only moves the position, and a file read
@@ -43,10 +42,6 @@ git submodule update --init
 cmake -S . -B build -A Win32 [-DSC4_PLUGINS_DIR="<SimCity 4 Plugins folder>"]
 cmake --build build --config Release
 ```
-
-`ctest --test-dir build -C Release` checks the reader of exemplar records, and
-`python tests/check_exemplar_types.py build/Release/exemplar_type_test.exe <folders>` runs it
-over the exemplars of real plugin folders.
 
 `SC4LoadProfiler.dll` is a test DLL: it times the phases of each city load and samples where the
 game spends it (`SC4LoadProfiler.log`, `-samples-N.tsv`, `-stacks-N.tsv` next to it). Not for
