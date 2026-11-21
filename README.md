@@ -20,14 +20,13 @@ Measured with a large plugins folder (Kanto Tokai region, plugins on OneDrive):
 - **Exemplar scans.** Nine places in the game load every exemplar to keep only one exemplar
   type (Type 21 network props, automata, demand and others). The type of each exemplar is
   remembered, and an exemplar of another type is not loaded again.
-
 - **File reads.** The game moves the file position with a system call before every read, also
   when the bytes are already in its read buffer, and reads text files such as NAM's RUL files
   512 bytes at a time. A seek inside the buffer now only moves the position, and a file read
   straight through gets a 64 KB buffer.
 
-All of it gives the game exactly what it would have read or built itself. Details, addresses and the review
-notes are in [docs/re-notes.md](docs/re-notes.md).
+All of it gives the game exactly what it would have read or built itself. Details, addresses
+and the review notes are in [docs/re-notes.md](docs/re-notes.md).
 
 ## Install
 
