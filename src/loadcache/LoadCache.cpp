@@ -16,6 +16,7 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -39,10 +40,13 @@ namespace
     // ---- game addresses ----
     constexpr uintptr_t kResourceManagerPtr = 0x00b43ca8;
     constexpr uintptr_t kGetResourceList = 0x009739cb;   // thiscall(rm, list** out, filter*) -> count
+    constexpr uintptr_t kFileSeek = 0x0091895a;          // thiscall(file, offset, mode) -> position
     constexpr uintptr_t kGetPropertyUint = 0x005fd480;   // cdecl(holder, id, uint32_t* out) -> bool
     constexpr uintptr_t kOperatorNew = 0x005e55e0;       // cdecl(size)
     constexpr uintptr_t kKeyListCtor = 0x00974e7a;       // thiscall(memory) -> list
     constexpr uintptr_t kTypeFilterVtable = 0x00ad8970;  // {vtable, refs, type}
+    // The filter interface of the type and group filter (0x00682020): {vtable, type, group}.
+    constexpr uintptr_t kTypeGroupFilterVtable = 0x00aaf4e0;
     constexpr uint32_t kPropertyHolderIid = 0xa52160f5;
     constexpr uint32_t kExemplarTypeProperty = 0x10;
     constexpr uint16_t kGameVersion = 641;
@@ -187,14 +191,89 @@ namespace
 
     void __cdecl CollectKey(const Key* key, void* keys) { static_cast<std::vector<Key>*>(keys)->push_back(*key); }
 
-    // The game's GetResourceList (0x009739cb) for a type filter: the same list, in the same
-    // order, with the keys of start-up segments from the cache.
+    // Types whose list is over kMaxKeptKeys: not built again.
+    std::unordered_set<uint32_t> gTooLarge;
+
+    // The keys of `type` in every start-up segment, built once: the game's loop over those
+    // segments with a type filter of its own kind on the stack (segments only call its
+    // IsKeyIncluded). Null when the type is not kept. Call with both locks held.
+    const TypeKeys* KeysOfType(const uint32_t type, const std::vector<void*>& segments)
+    {
+        if (const auto it = gTypes.find(type); it != gTypes.end()) {
+            return &it->second;
+        }
+        if (gTooLarge.contains(type)) {
+            return nullptr;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        void* scratch = NewKeyList();
+        if (!scratch) {
+            return nullptr;
+        }
+        struct
+        {
+            uintptr_t vtable = kTypeFilterVtable;
+            uint32_t refs = 1;
+            uint32_t type;
+        } filter{.type = type};
+        TypeKeys entry;
+        uint32_t size = 0;
+        bool whole = true;
+        for (void* segment : segments) {
+            if (!gStartupSegments.contains(segment)) {
+                continue;
+            }
+            const uint32_t returned = SegmentKeys(segment, scratch, &filter);
+            const uint32_t after = ListSize(scratch);
+            whole &= after >= size;
+            entry.runs[segment] = {size, after >= size ? after - size : 0, returned};
+            size = after;
+        }
+        const TypeKeys* kept = nullptr;
+        try {
+            if (whole && size <= kMaxKeptKeys) {
+                entry.keys.reserve(size);
+                ListEnum(scratch, &CollectKey, &entry.keys);
+                if (entry.keys.size() == size) {
+                    kept = &gTypes.emplace(type, std::move(entry)).first->second;
+                }
+            }
+            if (!kept) {
+                gTooLarge.insert(type);
+            }
+        }
+        catch (...) {
+            kept = nullptr;
+        }
+        Release(scratch);
+        ++gListMisses;
+        Log("Key lists: type %08X walked in %.0f ms (%u keys in %zu start-up segments)%s", type, MsSince(start), size,
+            gStartupSegments.size(), kept ? ", kept" : ", not kept");
+        return kept;
+    }
+
+    // The game's GetResourceList (0x009739cb) for a type filter or a type and group filter
+    // (0x00682020): the same list, in the same order, with the keys of start-up segments from
+    // the cache and the other segments asked as the game does.
     uint32_t __fastcall GetResourceListHook(void* rm, void* edx, void** out, void* filter)
     {
-        if (!filter || *static_cast<uintptr_t*>(filter) != kTypeFilterVtable || !out) {
+        if (!filter || !out) {
             return gGetResourceList(rm, edx, out, filter);
         }
-        const uint32_t type = static_cast<uint32_t*>(filter)[2];
+        const uintptr_t vtable = *static_cast<uintptr_t*>(filter);
+        uint32_t type, group = 0;
+        bool byGroup = false;
+        if (vtable == kTypeFilterVtable) {
+            type = static_cast<uint32_t*>(filter)[2];
+        }
+        else if (vtable == kTypeGroupFilterVtable) {
+            type = static_cast<uint32_t*>(filter)[1];
+            group = static_cast<uint32_t*>(filter)[2];
+            byGroup = true;
+        }
+        else {
+            return gGetResourceList(rm, edx, out, filter);
+        }
         const auto start = std::chrono::steady_clock::now();
         RmLock rmLock(rm, kResourceLock);  // the game's order: its lock first, then ours
         std::scoped_lock lock(gListMutex);
@@ -202,68 +281,40 @@ namespace
             return gGetResourceList(rm, edx, out, filter);
         }
         const std::vector<void*> segments = Segments(rm);
-        void* list = NewKeyList();
+        const TypeKeys* known = KeysOfType(type, segments);
+        void* list = known ? NewKeyList() : nullptr;
         if (!list) {
             return gGetResourceList(rm, edx, out, filter);
         }
         *out = list;
         uint32_t count = 0;
-        if (const auto known = gTypes.find(type); known != gTypes.end()) {
-            size_t asked = 0;
-            for (void* segment : segments) {
-                const auto run = known->second.runs.find(segment);
-                if (run == known->second.runs.end()) {
-                    count += SegmentKeys(segment, list, filter);  // not a start-up segment
-                    ++asked;
-                    continue;
-                }
-                const Key* key = known->second.keys.data() + run->second.first;
-                for (uint32_t i = 0; i < run->second.size; ++i) {
-                    ListInsert(list, key[i]);
-                }
-                count += run->second.returned;
-            }
-            if (++gListHits <= 100) {
-                Log("Key lists: type %08X from the cache in %.1f ms (%u keys, %zu segments asked)", type, MsSince(start),
-                    count, asked);
-            }
-            return count;
-        }
-        // First time for this type: the game's loop, noting each start-up segment's run.
-        TypeKeys entry;
-        uint32_t size = 0;
-        bool whole = true;
+        size_t asked = 0;
         for (void* segment : segments) {
-            const uint32_t returned = SegmentKeys(segment, list, filter);
-            count += returned;
-            const uint32_t after = ListSize(list);
-            whole &= after >= size;
-            if (gStartupSegments.contains(segment)) {
-                entry.runs[segment] = {size, after >= size ? after - size : 0, returned};
+            const auto run = known->runs.find(segment);
+            if (run == known->runs.end()) {
+                count += SegmentKeys(segment, list, filter);  // not a start-up segment
+                ++asked;
+                continue;
             }
-            size = after;
+            const Key* key = known->keys.data() + run->second.first;
+            if (byGroup) {
+                for (uint32_t i = 0; i < run->second.size; ++i) {
+                    if (key[i].group == group) {
+                        ListInsert(list, key[i]);
+                        ++count;
+                    }
+                }
+                continue;
+            }
+            for (uint32_t i = 0; i < run->second.size; ++i) {
+                ListInsert(list, key[i]);
+            }
+            count += run->second.returned;
         }
-        ++gListMisses;
-        // The list is complete here; a failure below only means nothing is kept.
-        try {
-            if (whole && size > kMaxKeptKeys) {
-                whole = false;
-            }
-            if (whole) {
-                // The runs index the whole list (the keys of later segments stay in it unused).
-                entry.keys.reserve(size);
-                ListEnum(list, &CollectKey, &entry.keys);
-                whole = entry.keys.size() == size;
-            }
-            if (whole) {
-                gTypes.emplace(type, std::move(entry));
-            }
+        if (++gListHits <= 100) {
+            Log("Key lists: type %08X%s from the cache in %.1f ms (%u keys, %zu segments asked)", type,
+                byGroup ? " by group" : "", MsSince(start), count, asked);
         }
-        catch (...) {
-            whole = false;
-        }
-        Log("Key lists: type %08X built in %.0f ms (%u keys, %zu segments)%s", type, MsSince(start), count,
-            segments.size(), whole ? ", kept" : ", not kept");
         return count;
     }
 
@@ -377,6 +428,35 @@ namespace
         return {reinterpret_cast<void*>(&ScanHook<I>)...};
     }
 
+    // ---- file seeks ----
+    // cRZFile::Seek (0x0091895a, vtable 0x00ad1e58 +0x34), thiscall (offset, mode 0 begin, 1
+    // current, 2 end) -> new position. It always calls SetFilePointer, also when the reads that
+    // follow come from its read buffer: the INI and RUL reader seeks back after every read.
+    // Fields: +0x18 open, +0x48 position, +0x4c the system's file position, +0x50 read buffer
+    // size (0: none), +0x60/+0x64 file offset and length of the buffered bytes, +0x7c bytes
+    // waiting to be written. Read (0x009192a9) copies from the buffer at +0x48 and seeks
+    // itself when +0x48 and +0x4c differ before it refills; Write (0x009193e3) does the same
+    // when the read buffer holds bytes. So a seek into the buffered bytes only needs +0x48.
+    using SeekFn = DWORD(__fastcall*)(void* file, void* edx, LONG offset, int mode);
+    SeekFn gSeek = nullptr;
+    std::atomic<uint64_t> gSeeksSkipped = 0, gSeeksPassed = 0;  // files are read on other threads too
+
+    DWORD __fastcall SeekHook(void* file, void* edx, const LONG offset, const int mode)
+    {
+        auto* f = static_cast<uint8_t*>(file);
+        const auto field = [f](const size_t at) -> int32_t& { return *reinterpret_cast<int32_t*>(f + at); };
+        if (f[0x18] != 0 && (mode == 0 || mode == 1) && field(0x7c) == 0 && field(0x50) != 0 && field(0x64) > 0) {
+            const int64_t target = mode == 0 ? offset : static_cast<int64_t>(field(0x48)) + offset;
+            if (target >= field(0x60) && target < static_cast<int64_t>(field(0x60)) + field(0x64)) {
+                field(0x48) = static_cast<int32_t>(target);
+                ++gSeeksSkipped;
+                return static_cast<DWORD>(target);
+            }
+        }
+        ++gSeeksPassed;
+        return gSeek(file, edx, offset, mode);
+    }
+
     uint16_t GameVersion()
     {
         wchar_t path[MAX_PATH]{};
@@ -430,6 +510,7 @@ public:
         };
         hook(kGetResourceList, reinterpret_cast<void*>(&GetResourceListHook), reinterpret_cast<void**>(&gGetResourceList),
              "GetResourceList");
+        hook(kFileSeek, reinterpret_cast<void*>(&SeekHook), reinterpret_cast<void**>(&gSeek), "cRZFile::Seek");
         const std::array<void*, kScanCount> scanHooks = ScanHooks(std::make_index_sequence<kScanCount>());
         for (size_t i = 0; i < kScanCount; ++i) {
             hook(kScans[i].address, scanHooks[i], reinterpret_cast<void**>(&gScanOriginal[i]), kScans[i].name);
@@ -461,8 +542,8 @@ public:
     bool PreAppShutdown() override
     {
         Log("Key lists: %llu from the cache, %llu built. Exemplar scans: %llu callbacks skipped, %llu passed, %zu "
-            "exemplar types known",
-            gListHits, gListMisses, gScanSkipped, gScanPassed, gExemplarTypes.size());
+            "exemplar types known. File seeks: %llu inside the buffer, %llu passed on",
+            gListHits, gListMisses, gScanSkipped, gScanPassed, gExemplarTypes.size(), gSeeksSkipped.load(), gSeeksPassed.load());
         return true;
     }
 };
