@@ -36,6 +36,12 @@ Later runs, same cities (one run each; first loads vary by a second or two):
 Growing every busy file made the first-load exemplar scan (`0x004a4310`) 2.5 times slower:
 plugin files are read at random places, so each refill read 64 KB for one small record.
 
+With the NAM fast loaders (RUL0 and RUL2 read in one go, nam-dll `perf/rul-load` and
+`perf/rul0-load`) the RUL files no longer go through the 512 byte buffer, so the growth only hit
+plugin files. Same five loads: first load 9.87 s with growth, 9.35 s without; removed. A raw
+ExemplarType reader (branch `perf/raw-exemplar-type`) was then measured at 9.35 s against 9.26 s
+without it, so it is not in `main`.
+
 ## Key lists
 
 - `ResourceManager::GetResourceList` `0x009739cb`, thiscall `(list** out, filter*)` -> key count
